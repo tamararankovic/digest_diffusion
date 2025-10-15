@@ -307,6 +307,12 @@ func (n *Node) onAggResult(msg AggResult, _ hyparview.Peer) {
 		Payload: msg,
 	}
 	for _, peer := range n.hv.GetPeers(1000) {
+		if !slices.ContainsFunc(slices.Collect(maps.Keys(n.PartialResults)), func(id string) bool {
+			return id == peer.Node.ID
+		}) {
+			// not a child
+			continue
+		}
 		err := peer.Conn.Send(forward)
 		if err != nil {
 			n.logger.Println(err)
@@ -342,6 +348,12 @@ func (n *Node) sendAgg() {
 			}
 			n.LastResult = result
 			for _, peer := range n.hv.GetPeers(1000) {
+				if !slices.ContainsFunc(slices.Collect(maps.Keys(n.PartialResults)), func(id string) bool {
+					return id == peer.Node.ID
+				}) {
+					// not a child
+					continue
+				}
 				err := peer.Conn.Send(msg)
 				if err != nil {
 					n.logger.Println(err)
