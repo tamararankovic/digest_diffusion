@@ -87,8 +87,7 @@ func (n *Node) updateMaxState() {
 		if msg.Msg.Value > currMax.Msg.Value ||
 			(msg.Msg.Value == currMax.Msg.Value && msg.Msg.Source < currMax.Msg.Source) ||
 			(msg.Msg.Value == currMax.Msg.Value && msg.Msg.Source == currMax.Msg.Source && msg.Msg.HopDistance < currMax.Msg.HopDistance) ||
-			(msg.Msg.Value == currMax.Msg.Value && msg.Msg.Source == currMax.Msg.Source && msg.Msg.HopDistance == currMax.Msg.HopDistance && msg.Msg.TTL > currMax.Msg.TTL) ||
-			(msg.Msg.Value == currMax.Msg.Value && msg.Msg.Source == currMax.Msg.Source && msg.Msg.HopDistance == currMax.Msg.HopDistance && msg.Msg.TTL == currMax.Msg.TTL && sentBy < from) {
+			(msg.Msg.Value == currMax.Msg.Value && msg.Msg.Source == currMax.Msg.Source && msg.Msg.HopDistance == currMax.Msg.HopDistance && sentBy < from) {
 			currMax = msg
 			from = sentBy
 		}

@@ -47,7 +47,7 @@ for i in $(seq "$(($INDEX))" "$(($INDEX + $COUNT -1))"); do
         -e CONTACT_NODE_ID="$CONTACT_NODE_ID" \
         -e CONTACT_NODE_ADDR="$CONTACT_NODE_ADDR" \
         -e LISTEN_ADDR="$LISTEN_ADDR" \
-        -v "$(pwd)/${LOG}:/var/log/fu" \
+        -v "$(pwd)/${LOG}:/var/log/monoceros" \
         "$IMAGE"
 
     sleep 0.5
