@@ -1,24 +1,21 @@
-FROM golang:latest AS builder
+FROM golang:1.24-alpine AS builder
 
 WORKDIR /app
 
-COPY digest_diffusion/go.mod digest_diffusion/go.sum ./
+COPY go.mod go.sum ./
 
-COPY hyparview ../hyparview
+RUN go mod tidy
 
-RUN go mod download
+COPY . .
 
-COPY digest_diffusion .
-
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o /main .
+RUN go build -o node .
 
 FROM alpine:latest
 
 WORKDIR /app
 
-RUN mkdir -p /var/log/fu
+COPY --from=builder /app/node /usr/local/bin/node
 
-# Copy Go binaries
-COPY --from=builder  /main  ./main
+EXPOSE 8000/udp
 
-CMD [ "/app/main" ]
+ENTRYPOINT ["/usr/local/bin/node"]

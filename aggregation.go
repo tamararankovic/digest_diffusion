@@ -6,13 +6,11 @@ import (
 	"log"
 	"maps"
 	"math"
-	"math/rand/v2"
 	"slices"
 	"time"
 
-	"github.com/c12s/hyparview/data"
-	"github.com/c12s/hyparview/hyparview"
 	dto "github.com/prometheus/client_model/go"
+	"github.com/tamararankovic/digest_diffusion/peers"
 )
 
 type AggregationFunc byte
@@ -229,19 +227,14 @@ func (m *Node) getLatestForNode() []IntermediateMetric {
 	local := make([]IntermediateMetric, 0)
 	metrics := m.fetchNodeMetrics()
 	metrics = filterByTypes(metrics, []*dto.MetricType{dto.MetricType_GAUGE.Enum()})
-	// m.logger.Println("get node metrics")
 	for _, rule := range m.rules {
-		// m.logger.Println(rule)
 		input := selectRawMetricsValues(rule.InputSelector, metrics)
-		// m.logger.Println(input)
 		inputIM := rawMetricsToIM(input, rule)
 		im := aggregate(inputIM)
-		// m.logger.Println(im)
 		if im == nil {
 			continue
 		}
 		local = append(local, *im)
-		// m.logger.Println("local", local)
 	}
 	return local
 }
@@ -276,125 +269,74 @@ func aggregate(input []IntermediateMetric) *IntermediateMetric {
 	return &ir
 }
 
-const AGG_MSG_TYPE data.MessageType = AGG_MAX_MSG_TYPE + 1
-const AGG_MSG_RESP_TYPE data.MessageType = AGG_MAX_MSG_TYPE + 2
-
-func (n *Node) onAgg(msg Agg, sender hyparview.Peer) {
+// locked by caller
+func (n *Node) onAgg(msg *Agg, sender peers.Peer, round int) {
 	msgRcvd := PartialResult{
-		Time:      time.Now().UnixNano(),
+		Round:     round,
 		Aggregate: msg.Aggregate,
 	}
-	n.lock.Lock()
-	defer n.lock.Unlock()
-	n.PartialResults[sender.Node.ID] = msgRcvd
+	n.PartialResults[sender.GetID()] = msgRcvd
 }
 
-func (n *Node) onAggResult(msg AggResult, _ hyparview.Peer) {
-	n.lock.Lock()
-	defer n.lock.Unlock()
+// locked by caller
+func (n *Node) onAggResult(msg *AggResult, _ peers.Peer) {
 	if msg.Time <= n.LastResult.Time {
 		// already seen
 		return
 	}
-	n.LastResult = msg
+	n.LastResult = *msg
 	om, err := imToOpenMetrics(msg.Aggregate)
 	if err != nil {
-		n.logger.Println(err)
+		log.Println(err)
 	} else {
-		n.logger.Println(om)
+		log.Println(om)
 	}
-	forward := data.Message{
-		Type:    AGG_MSG_RESP_TYPE,
-		Payload: msg,
-	}
-	for _, peer := range n.hv.GetPeers(1000) {
-		// if !slices.ContainsFunc(slices.Collect(maps.Keys(n.PartialResults)), func(id string) bool {
-		// 	return id == peer.Node.ID
-		// }) {
-		// 	// not a child
-		// 	continue
-		// }
-		if rand.Float64() < 0.5 {
-			continue
-		}
-		err := peer.Conn.Send(forward)
-		if err != nil {
-			n.logger.Println(err)
-		}
+	forward := MsgToBytes(msg)
+	for _, peer := range n.Peers.GetPeers() {
+		peer.Send(forward)
 	}
 }
 
 func (n *Node) sendAgg() {
-	for range time.NewTicker(time.Duration(n.TAgg) * time.Second).C {
-		n.lock.Lock()
-		partials := slices.Collect(maps.Values(n.PartialResults))
-		ims := []IntermediateMetric{}
-		for _, partial := range partials {
-			ims = append(ims, partial.Aggregate...)
-		}
-		finalIm := combineAggregates(n.getLatestForNode(), ims, n.rules)
-		if n.Parent == nil || n.Parent.Conn == nil {
-			n.logger.Println("no parent")
-			om, err := imToOpenMetrics(finalIm)
-			if err != nil {
-				n.logger.Println(err)
-			} else {
-				n.logger.Println(om)
-			}
-			// broadcast
-			result := AggResult{
-				Time:      time.Now().UnixNano(),
-				Aggregate: finalIm,
-			}
-			msg := data.Message{
-				Type:    AGG_MSG_RESP_TYPE,
-				Payload: result,
-			}
-			n.LastResult = result
-			for _, peer := range n.hv.GetPeers(1000) {
-				// if !slices.ContainsFunc(slices.Collect(maps.Keys(n.PartialResults)), func(id string) bool {
-				// 	return id == peer.Node.ID
-				// }) {
-				// 	// not a child
-				// 	continue
-				// }
-				if rand.Float64() < 0.5 {
-					continue
-				}
-				err := peer.Conn.Send(msg)
-				if err != nil {
-					n.logger.Println(err)
-				}
-			}
-			n.lock.Unlock()
-			continue
-		}
-		msg := data.Message{
-			Type: AGG_MSG_TYPE,
-			Payload: Agg{
-				Aggregate: finalIm,
-			},
-		}
-		err := n.Parent.Conn.Send(msg)
+	partials := slices.Collect(maps.Values(n.PartialResults))
+	ims := []IntermediateMetric{}
+	for _, partial := range partials {
+		ims = append(ims, partial.Aggregate...)
+	}
+	finalIm := combineAggregates(n.getLatestForNode(), ims, n.rules)
+	if n.Parent == nil {
+		log.Println("no parent")
+		om, err := imToOpenMetrics(finalIm)
 		if err != nil {
-			n.logger.Println(err)
+			log.Println(err)
+		} else {
+			log.Println(om)
 		}
-		n.lock.Unlock()
+		// broadcast
+		result := AggResult{
+			Time:      time.Now().UnixNano(),
+			Aggregate: finalIm,
+		}
+		msg := MsgToBytes(result)
+		n.LastResult = result
+		for _, peer := range n.Peers.GetPeers() {
+			peer.Send(msg)
+		}
+	} else {
+		msg := MsgToBytes(Agg{
+			Aggregate: finalIm,
+		})
+		n.Parent.Send(msg)
 	}
 }
 
-func (n *Node) syncAggState() {
-	for range time.NewTicker(300 * time.Millisecond).C {
-		n.lock.Lock()
-		remove := []string{}
-		for from, msg := range n.PartialResults {
-			if msg.Time+int64(n.TAgg)*int64(n.InactivityIntervals)*1000000000 < time.Now().UnixNano() {
-				remove = append(remove, from)
-			}
+func (n *Node) syncAggState(round int) {
+	activePartialResults := make(map[string]PartialResult)
+	for _, peer := range n.Peers.GetPeers() {
+		if round-n.PartialResults[peer.GetID()].Round > n.Rmax {
+			continue
 		}
-		for _, from := range remove {
-			delete(n.PartialResults, from)
-		}
-		n.lock.Unlock()
+		activePartialResults[peer.GetID()] = n.PartialResults[peer.GetID()]
 	}
+	n.PartialResults = activePartialResults
 }

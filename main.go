@@ -13,93 +13,73 @@ import (
 	"sync"
 	"time"
 
-	"github.com/c12s/hyparview/data"
-	"github.com/c12s/hyparview/hyparview"
-	"github.com/c12s/hyparview/transport"
-	"github.com/caarlos0/env"
+	"github.com/tamararankovic/digest_diffusion/config"
+	"github.com/tamararankovic/digest_diffusion/peers"
 )
 
 type PartialResult struct {
-	Time      int64
+	Round     int
 	Aggregate []IntermediateMetric
 }
 
 type LastMax struct {
-	Time int64
-	Msg  MaxAgg
+	Msg MaxAgg
 }
 
 type Node struct {
 	ID             string
 	Value          float64
-	Parent         *hyparview.Peer
+	Parent         *peers.Peer
 	PartialResults map[string]PartialResult
 	LastMaxResults map[string]LastMax
 	CurrentMax     LastMax
+	MaxSeqNo       int
+	Stagnation     map[string]int
+	LastSeq        map[string]int
 	LastResult     AggResult
 
-	TAgg                int
-	TAggMax             int
-	TTL                 int
-	InactivityIntervals int
+	TAgg int
+	Rmax int
 
-	hv            *hyparview.HyParView
+	Peers         *peers.Peers
 	lock          *sync.Mutex
-	logger        *log.Logger
 	latestMetrics map[string]string
 	latestIM      map[string][]IntermediateMetric
 	rules         []AggregationRule
 }
 
 func main() {
-	hvConfig := hyparview.Config{}
-	err := env.Parse(&hvConfig)
+	time.Sleep(10 * time.Second)
+
+	cfg := config.LoadConfigFromEnv()
+	params := config.LoadParamsFromEnv()
+
+	ps, err := peers.NewPeers(cfg)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	cfg := Config{}
-	err = env.Parse(&cfg)
+	val, err := strconv.Atoi(params.ID)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	self := data.Node{
-		ID:            cfg.NodeID,
-		ListenAddress: cfg.ListenAddr,
-	}
-
-	logger := log.New(os.Stdout, "", log.LstdFlags|log.Lshortfile)
-
-	gnConnManager := transport.NewConnManager(
-		transport.NewTCPConn,
-		transport.AcceptTcpConnsFn(self.ListenAddress),
-	)
-
-	hv, err := hyparview.NewHyParView(hvConfig, self, gnConnManager, logger)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	val, err := strconv.Atoi(strings.Split(cfg.NodeID, "_")[2])
-	if err != nil {
-		logger.Fatal(err)
-	}
+	lastRcvd := make(map[string]int)
+	round := 0
 
 	node := &Node{
-		ID:                  cfg.NodeID,
-		Value:               float64(val),
-		PartialResults:      make(map[string]PartialResult),
-		LastMaxResults:      make(map[string]LastMax),
-		TAgg:                cfg.TAgg,
-		TAggMax:             cfg.TAggMax,
-		TTL:                 cfg.TTL,
-		InactivityIntervals: cfg.InactivityIntervals,
-		hv:                  hv,
-		lock:                &sync.Mutex{},
-		logger:              logger,
-		latestMetrics:       make(map[string]string),
-		latestIM:            make(map[string][]IntermediateMetric),
+		ID:             params.ID,
+		Value:          float64(val),
+		PartialResults: make(map[string]PartialResult),
+		LastMaxResults: make(map[string]LastMax),
+		Stagnation:     make(map[string]int),
+		LastSeq:        make(map[string]int),
+		TAgg:           params.Tagg,
+		Rmax:           params.Rmax,
+		Peers:          ps,
+		lock:           &sync.Mutex{},
+		latestMetrics:  make(map[string]string),
+		latestIM:       make(map[string][]IntermediateMetric),
 		rules: []AggregationRule{
 			{
 				InputSelector: MetricMetadata{
@@ -128,44 +108,39 @@ func main() {
 		},
 	}
 	currMax := LastMax{
-		Time: time.Now().UnixNano(),
 		Msg: MaxAgg{
 			Value:       node.Value,
 			Source:      node.ID,
 			HopDistance: 0,
-			TTL:         node.TTL,
+			SeqNo:       round,
 		},
 	}
 	node.CurrentMax = currMax
 	node.LastMaxResults[node.ID] = currMax
 
-	hv.AddClientMsgHandler(AGG_MAX_MSG_TYPE, func(msgBytes []byte, sender hyparview.Peer) {
-		msg := MaxAgg{}
-		err := transport.Deserialize(msgBytes, &msg)
-		if err != nil {
-			logger.Println(node.ID, "-", "Error unmarshaling message:", err)
-			return
+	maxAggMsgs := make(map[peers.Peer]*MaxAgg)
+	aggMsgs := make(map[peers.Peer]*Agg)
+	aggResultMsgs := make(map[peers.Peer]*AggResult)
+
+	// handle messages
+	go func() {
+		for msgRcvd := range ps.Messages {
+			msg := BytesToMsg(msgRcvd.MsgBytes)
+			if msg == nil {
+				continue
+			}
+			node.lock.Lock()
+			switch msg.Type() {
+			case MAX_AGG_MSG_TYPE:
+				maxAggMsgs[msgRcvd.Sender] = msg.(*MaxAgg)
+			case AGG_MSG_TYPE:
+				aggMsgs[msgRcvd.Sender] = msg.(*Agg)
+			case AGG_RESULT_MSG_TYPE:
+				aggResultMsgs[msgRcvd.Sender] = msg.(*AggResult)
+			}
+			node.lock.Unlock()
 		}
-		node.onMax(msg, sender)
-	})
-	hv.AddClientMsgHandler(AGG_MSG_TYPE, func(msgBytes []byte, sender hyparview.Peer) {
-		msg := Agg{}
-		err := transport.Deserialize(msgBytes, &msg)
-		if err != nil {
-			logger.Println(node.ID, "-", "Error unmarshaling message:", err)
-			return
-		}
-		node.onAgg(msg, sender)
-	})
-	hv.AddClientMsgHandler(AGG_MSG_RESP_TYPE, func(msgBytes []byte, sender hyparview.Peer) {
-		msg := AggResult{}
-		err := transport.Deserialize(msgBytes, &msg)
-		if err != nil {
-			logger.Println(node.ID, "-", "Error unmarshaling message:", err)
-			return
-		}
-		node.onAggResult(msg, sender)
-	})
+	}()
 
 	go func() {
 		for range time.NewTicker(time.Second).C {
@@ -174,28 +149,44 @@ func main() {
 		}
 	}()
 
-	err = hv.Join(cfg.ContactID, cfg.ContactAddr)
-	if err != nil {
-		logger.Fatal(err)
-	}
-
-	go node.sendMax()
-	go node.sendAgg()
-	go node.syncMaxState()
-	go node.syncAggState()
+	// rounds
+	go func() {
+		for range time.NewTicker(time.Duration(node.TAgg) * time.Second).C {
+			round++
+			node.lock.Lock()
+			for sender, msg := range maxAggMsgs {
+				lastRcvd[sender.GetID()] = round
+				node.onMax(msg, sender, round)
+			}
+			for sender, msg := range aggMsgs {
+				lastRcvd[sender.GetID()] = round
+				node.onAgg(msg, sender, round)
+			}
+			for sender, msg := range aggResultMsgs {
+				lastRcvd[sender.GetID()] = round
+				node.onAggResult(msg, sender)
+			}
+			maxAggMsgs = make(map[peers.Peer]*MaxAgg)
+			aggMsgs = make(map[peers.Peer]*Agg)
+			aggResultMsgs = make(map[peers.Peer]*AggResult)
+			for _, peer := range ps.GetPeers() {
+				if lastRcvd[peer.GetID()]+params.Rmax < round && round > 10 {
+					ps.PeerFailed(peer.GetID())
+				}
+			}
+			node.syncMaxState(round)
+			node.syncAggState(round)
+			node.sendMax()
+			node.sendAgg()
+			node.lock.Unlock()
+		}
+	}()
 
 	r := http.NewServeMux()
 	r.HandleFunc("POST /metrics", node.setMetricsHandler)
 	log.Println("Metrics server listening")
 
-	go func() {
-		log.Fatal(http.ListenAndServe(strings.Split(os.Getenv("LISTEN_ADDR"), ":")[0]+":9200", r))
-	}()
-
-	r2 := http.NewServeMux()
-	r2.HandleFunc("GET /state", node.StateHandler)
-	log.Println("State server listening on :5001/state")
-	log.Fatal(http.ListenAndServe(strings.Split(os.Getenv("LISTEN_ADDR"), ":")[0]+":5001", r2))
+	log.Fatal(http.ListenAndServe(strings.Split(os.Getenv("LISTEN_ADDR"), ":")[0]+":9200", r))
 }
 
 func (m *Node) exportResult(ims []IntermediateMetric, tree string, reqTimestamp, rcvTimestamp int64) {
@@ -205,13 +196,12 @@ func (m *Node) exportResult(ims []IntermediateMetric, tree string, reqTimestamp,
 			name += k + "=" + im.Metadata.Labels[k] + " "
 		}
 		name += "}"
-		filename := fmt.Sprintf("/var/log/monoceros/results/%s.csv", name)
-		// defer file.Close()
+		filename := fmt.Sprintf("/var/log/diffusion/%s.csv", name)
 		writer := writers[filename]
 		if writer == nil {
 			file, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0666)
 			if err != nil {
-				m.logger.Printf("failed to open/create file: %v", err)
+				log.Printf("failed to open/create file: %v", err)
 				continue
 			}
 			writer = csv.NewWriter(file)
@@ -223,7 +213,7 @@ func (m *Node) exportResult(ims []IntermediateMetric, tree string, reqTimestamp,
 		valStr := strconv.FormatFloat(im.Result.ComputeFinal(), 'f', -1, 64)
 		err := writer.Write([]string{tree, reqTsStr, rcvTsStr, valStr})
 		if err != nil {
-			m.logger.Println(err)
+			log.Println(err)
 		}
 	}
 }
@@ -231,13 +221,12 @@ func (m *Node) exportResult(ims []IntermediateMetric, tree string, reqTimestamp,
 var writers map[string]*csv.Writer = map[string]*csv.Writer{}
 
 func (m *Node) exportMsgCount() {
-	filename := "/var/log/monoceros/results/msg_count.csv"
-	// defer file.Close()
+	filename := "/var/log/diffusion/msg_count.csv"
 	writer := writers[filename]
 	if writer == nil {
 		file, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0666)
 		if err != nil {
-			m.logger.Printf("failed to open/create file: %v", err)
+			log.Printf("failed to open/create file: %v", err)
 			return
 		}
 		writer = csv.NewWriter(file)
@@ -245,16 +234,16 @@ func (m *Node) exportMsgCount() {
 	}
 	defer writer.Flush()
 	tsStr := strconv.Itoa(int(time.Now().UnixNano()))
-	transport.MessagesSentLock.Lock()
-	sent := transport.MessagesSent - transport.MessagesSentSub
-	transport.MessagesSentLock.Unlock()
-	transport.MessagesRcvdLock.Lock()
-	rcvd := transport.MessagesRcvd - transport.MessagesRcvdSub
-	transport.MessagesRcvdLock.Unlock()
+	peers.MessagesSentLock.Lock()
+	sent := peers.MessagesSent
+	peers.MessagesSentLock.Unlock()
+	peers.MessagesRcvdLock.Lock()
+	rcvd := peers.MessagesRcvd
+	peers.MessagesRcvdLock.Unlock()
 	sentStr := strconv.Itoa(sent)
 	rcvdStr := strconv.Itoa(rcvd)
 	err := writer.Write([]string{tsStr, sentStr, rcvdStr})
 	if err != nil {
-		m.logger.Println(err)
+		log.Println(err)
 	}
 }

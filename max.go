@@ -1,106 +1,187 @@
 package main
 
 import (
-	"slices"
-	"time"
+	"log"
+	"sort"
 
-	"github.com/c12s/hyparview/data"
-	"github.com/c12s/hyparview/hyparview"
+	"github.com/tamararankovic/digest_diffusion/peers"
 )
 
-const AGG_MAX_MSG_TYPE data.MessageType = data.UNKNOWN + 1
-
-func (n *Node) onMax(msg MaxAgg, sender hyparview.Peer) {
+// locked by caller
+func (n *Node) onMax(msg *MaxAgg, sender peers.Peer, round int) {
 	msg.HopDistance++
-	// msg.TTL--
-	if msg.TTL == 0 {
-		return
-	}
 	msgRcvd := LastMax{
-		Time: time.Now().UnixNano(),
-		Msg:  msg,
+		Msg: *msg,
 	}
-	n.lock.Lock()
-	defer n.lock.Unlock()
-	n.LastMaxResults[sender.Node.ID] = msgRcvd
+	n.LastMaxResults[sender.GetID()] = msgRcvd
 }
 
+// locked by caller
 func (n *Node) sendMax() {
-	for range time.NewTicker(time.Duration(n.TAggMax) * time.Second).C {
-		n.lock.Lock()
-		n.decreaseTTL()
-		n.updateMaxState()
-		payload := n.CurrentMax.Msg
-		n.lock.Unlock()
-		msg := data.Message{
-			Type:    AGG_MAX_MSG_TYPE,
-			Payload: payload,
-		}
-		for _, peer := range n.hv.GetPeers(1000) {
-			err := peer.Conn.Send(msg)
-			if err != nil {
-				n.logger.Println(err)
-			}
-		}
-		n.logger.Println("current max source", n.CurrentMax.Msg.Source)
+	payload := n.CurrentMax.Msg
+	msg := MsgToBytes(payload)
+	for _, peer := range n.Peers.GetPeers() {
+		peer.Send(msg)
 	}
-}
-
-func (n *Node) syncMaxState() {
-	for range time.NewTicker(300 * time.Millisecond).C {
-		n.lock.Lock()
-		n.updateMaxState()
-		n.lock.Unlock()
-	}
+	log.Println("current max source", n.CurrentMax.Msg.Source)
 }
 
 // locked by caller
-func (n *Node) decreaseTTL() {
-	for from, msg := range n.LastMaxResults {
-		msg.Msg.TTL--
-		n.LastMaxResults[from] = msg
-	}
-}
+func (n *Node) syncMaxState(round int) {
 
-// locked by caller
-func (n *Node) updateMaxState() {
-	remove := []string{}
-	for from, msg := range n.LastMaxResults {
-		if msg.Time+int64(n.TAggMax)*int64(n.InactivityIntervals)*1000000000 < time.Now().UnixNano() || msg.Msg.TTL == 0 {
-			remove = append(remove, from)
+	// 0. remove failed peers
+
+	activeMax := make(map[string]LastMax)
+	for _, peer := range n.Peers.GetPeers() {
+		if lm, ok := n.LastMaxResults[peer.GetID()]; ok {
+			activeMax[peer.GetID()] = lm
 		}
 	}
-	for _, from := range remove {
-		delete(n.LastMaxResults, from)
+	n.LastMaxResults = activeMax
+
+	//--------------------------------------------------------------------
+	// 1. Build buckets: group LastMaxResults + selfMax by Source
+	//--------------------------------------------------------------------
+
+	type entry struct {
+		from string
+		max  LastMax
 	}
-	currMax := LastMax{
-		Time: time.Now().UnixNano(),
+
+	buckets := make(map[string][]entry)
+
+	// include peer messages
+	for from, msg := range n.LastMaxResults {
+		src := msg.Msg.Source
+		buckets[src] = append(buckets[src], entry{from, msg})
+	}
+
+	// include self
+	selfMax := LastMax{
 		Msg: MaxAgg{
 			Value:       n.Value,
 			Source:      n.ID,
 			HopDistance: 0,
-			TTL:         n.TTL,
+			SeqNo:       round,
 		},
 	}
-	from := ""
-	for sentBy, msg := range n.LastMaxResults {
-		if msg.Msg.Value > currMax.Msg.Value ||
-			(msg.Msg.Value == currMax.Msg.Value && msg.Msg.Source < currMax.Msg.Source) ||
-			(msg.Msg.Value == currMax.Msg.Value && msg.Msg.Source == currMax.Msg.Source && msg.Msg.HopDistance < currMax.Msg.HopDistance) ||
-			(msg.Msg.Value == currMax.Msg.Value && msg.Msg.Source == currMax.Msg.Source && msg.Msg.HopDistance == currMax.Msg.HopDistance && sentBy < from) {
-			currMax = msg
-			from = sentBy
+	buckets[n.ID] = append(buckets[n.ID], entry{"", selfMax})
+
+	//--------------------------------------------------------------------
+	// 2. Compute max seqno per source (only for staleness detection)
+	//--------------------------------------------------------------------
+
+	latestSeq := make(map[string]int) // highest seqno per source
+
+	for src, msgs := range buckets {
+		maxSeq := msgs[0].max.Msg.SeqNo
+		for _, m := range msgs[1:] {
+			if m.max.Msg.SeqNo > maxSeq {
+				maxSeq = m.max.Msg.SeqNo
+			}
+		}
+		latestSeq[src] = maxSeq
+	}
+
+	//--------------------------------------------------------------------
+	// 3. Update staleness counters and remove stale sources
+	//--------------------------------------------------------------------
+
+	for src, newSeq := range latestSeq {
+		oldSeq := n.LastSeq[src]
+
+		if newSeq > oldSeq {
+			// fresh update
+			n.Stagnation[src] = 0
+			n.LastSeq[src] = newSeq
+		} else {
+			// no increase → candidate for staleness
+			n.Stagnation[src]++
 		}
 	}
-	n.CurrentMax = currMax
-	peers := n.hv.GetPeers(1000)
-	idx := slices.IndexFunc(peers, func(p hyparview.Peer) bool {
-		return p.Node.ID == from
+
+	// purge stale *sources*
+	for src := range buckets {
+		if n.Stagnation[src] > n.Rmax {
+			delete(buckets, src)
+			// delete(n.Stagnation, src)
+			// delete(n.LastSeq, src)
+		}
+	}
+
+	if len(buckets) == 0 {
+		// only our own self remains
+		n.CurrentMax = selfMax
+		n.Parent = nil
+		return
+	}
+
+	//--------------------------------------------------------------------
+	// 4. Flatten all messages from all non-stale sources
+	//--------------------------------------------------------------------
+
+	type candidate struct {
+		from string
+		max  LastMax
+	}
+
+	cands := make([]candidate, 0)
+	for _, list := range buckets {
+		for _, e := range list {
+			cands = append(cands, candidate{e.from, e.max})
+		}
+	}
+
+	//--------------------------------------------------------------------
+	// 5. Deterministic winner selection
+	//--------------------------------------------------------------------
+
+	// Order: Value DESC → Source ASC → HopDistance ASC → From ASC
+	sort.Slice(cands, func(i, j int) bool {
+		mi := cands[i].max.Msg
+		mj := cands[j].max.Msg
+
+		if mi.Value != mj.Value {
+			return mi.Value > mj.Value
+		}
+		if mi.Source != mj.Source {
+			return mi.Source < mj.Source
+		}
+		if mi.HopDistance != mj.HopDistance {
+			return mi.HopDistance < mj.HopDistance
+		}
+		return cands[i].from < cands[j].from
 	})
-	if idx == -1 {
+
+	winner := cands[0]
+
+	//--------------------------------------------------------------------
+	// 6. Determine parent
+	//--------------------------------------------------------------------
+
+	if winner.from == "" {
+		// We chose our own selfMax
 		n.Parent = nil
 	} else {
-		n.Parent = &peers[idx]
-		n.logger.Println("parent changed", n.Parent.Node.ID)
+		ps := n.Peers.GetPeers()
+		var found bool
+		for i := range ps {
+			if ps[i].GetID() == winner.from {
+				if n.Parent == nil || n.Parent.GetID() != ps[i].GetID() {
+					log.Println("parent changed to", winner.from)
+				}
+				n.Parent = &ps[i]
+				found = true
+				break
+			}
+		}
+		if !found {
+			n.Parent = nil
+		}
 	}
+
+	//--------------------------------------------------------------------
+	// 7. Update current max
+	//--------------------------------------------------------------------
+	n.CurrentMax = winner.max
 }

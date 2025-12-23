@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"log"
 	"maps"
 	"net/http"
 	"os"
@@ -67,7 +68,7 @@ app_errors_total 17
 # EOF
 `
 
-var initVal string = strings.Split(os.Getenv("NODE_ID"), "_")[2]
+var initVal string = os.Getenv("ID")
 var wasSet bool = false
 
 func (m *Node) fetchNodeMetrics() []*dto.MetricFamily {
@@ -78,7 +79,7 @@ func (m *Node) fetchNodeMetrics() []*dto.MetricFamily {
 	}
 	mfs, err := parseOpenMetrics(tmpMetrics)
 	if err != nil {
-		m.logger.Println(err)
+		log.Println(err)
 		return result
 	}
 	sourceLabelName := "source"
@@ -97,7 +98,7 @@ func (m *Node) fetchNodeMetrics() []*dto.MetricFamily {
 	}
 	om, err := toOpenMetrics(result)
 	if err != nil {
-		m.logger.Println(err)
+		log.Println(err)
 	} else {
 		m.latestMetrics["node"] = om
 	}
@@ -247,8 +248,8 @@ func (n *Node) setMetricsHandler(w http.ResponseWriter, r *http.Request) {
 	n.lock.Lock()
 	wasSet = true
 	metrics = string(newMetrics)
-	n.logger.Println("metrics set")
-	n.logger.Println(metrics)
+	log.Println("metrics set")
+	log.Println(metrics)
 	n.lock.Unlock()
 	w.WriteHeader(http.StatusOK)
 }
