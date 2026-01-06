@@ -2,12 +2,9 @@ package main
 
 import (
 	"encoding/csv"
-	"fmt"
 	"log"
-	"maps"
 	"net/http"
 	"os"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -190,32 +187,43 @@ func main() {
 }
 
 func (m *Node) exportResult(ims []IntermediateMetric, tree string, reqTimestamp, rcvTimestamp int64) {
+	var metric *IntermediateMetric
 	for _, im := range ims {
-		name := im.Metadata.Name + "{ "
-		for _, k := range slices.Sorted(maps.Keys(im.Metadata.Labels)) {
-			name += k + "=" + im.Metadata.Labels[k] + " "
-		}
-		name += "}"
-		filename := fmt.Sprintf("/var/log/digest_diffusion/%s.csv", name)
-		writer := writers[filename]
-		if writer == nil {
-			file, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0666)
-			if err != nil {
-				log.Printf("failed to open/create file: %v", err)
-				continue
-			}
-			writer = csv.NewWriter(file)
-			writers[filename] = writer
-		}
-		defer writer.Flush()
-		reqTsStr := strconv.Itoa(int(reqTimestamp))
-		rcvTsStr := strconv.Itoa(int(rcvTimestamp))
-		valStr := strconv.FormatFloat(im.Result.ComputeFinal(), 'f', -1, 64)
-		err := writer.Write([]string{tree, reqTsStr, rcvTsStr, valStr})
-		if err != nil {
-			log.Println(err)
+		if im.Metadata.Name == "avg_app_memory_usage_bytes" {
+			metric = &im
 		}
 	}
+	if metric == nil {
+		return
+	}
+	// for _, im := range ims {
+	// 	name := im.Metadata.Name + "{ "
+	// 	for _, k := range slices.Sorted(maps.Keys(im.Metadata.Labels)) {
+	// 		name += k + "=" + im.Metadata.Labels[k] + " "
+	// 	}
+	// 	name += "}"
+	// 	filename := fmt.Sprintf("/var/log/digest_diffusion/%s.csv", name)
+	filename := "/var/log/digest_diffusion/value.csv"
+	writer := writers[filename]
+	if writer == nil {
+		file, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0666)
+		if err != nil {
+			log.Printf("failed to open/create file: %v", err)
+			// continue
+			return
+		}
+		writer = csv.NewWriter(file)
+		writers[filename] = writer
+	}
+	defer writer.Flush()
+	reqTsStr := strconv.Itoa(int(reqTimestamp))
+	rcvTsStr := strconv.Itoa(int(rcvTimestamp))
+	valStr := strconv.FormatFloat(metric.Result.ComputeFinal(), 'f', -1, 64)
+	err := writer.Write([]string{tree, reqTsStr, rcvTsStr, valStr})
+	if err != nil {
+		log.Println(err)
+	}
+	// }
 }
 
 var writers map[string]*csv.Writer = map[string]*csv.Writer{}
