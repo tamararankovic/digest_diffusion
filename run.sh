@@ -104,7 +104,7 @@ for i in $(seq 1 $N); do
     -e LISTEN_PORT="$PORT" \
     -e PEER_IDS="$PEER_IDS" \
     -e PEER_HOSTS="$PEER_HOSTS" \
-    -v "$(pwd)/${LOG}:/var/log/diffusion" \
+    -v "$(pwd)/${LOG}:/var/log/digest_diffusion" \
     -p "${HOST_PORT}:9200" \
     node:latest >/dev/null
 

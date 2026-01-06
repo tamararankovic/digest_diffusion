@@ -196,7 +196,7 @@ func (m *Node) exportResult(ims []IntermediateMetric, tree string, reqTimestamp,
 			name += k + "=" + im.Metadata.Labels[k] + " "
 		}
 		name += "}"
-		filename := fmt.Sprintf("/var/log/diffusion/%s.csv", name)
+		filename := fmt.Sprintf("/var/log/digest_diffusion/%s.csv", name)
 		writer := writers[filename]
 		if writer == nil {
 			file, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0666)
@@ -221,7 +221,7 @@ func (m *Node) exportResult(ims []IntermediateMetric, tree string, reqTimestamp,
 var writers map[string]*csv.Writer = map[string]*csv.Writer{}
 
 func (m *Node) exportMsgCount() {
-	filename := "/var/log/diffusion/msg_count.csv"
+	filename := "/var/log/digest_diffusion/msg_count.csv"
 	writer := writers[filename]
 	if writer == nil {
 		file, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0666)
