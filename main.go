@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"os"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -183,7 +182,7 @@ func main() {
 	r.HandleFunc("POST /metrics", node.setMetricsHandler)
 	log.Println("Metrics server listening")
 
-	log.Fatal(http.ListenAndServe(strings.Split(os.Getenv("LISTEN_ADDR"), ":")[0]+":9200", r))
+	log.Fatal(http.ListenAndServe(cfg.ListenIP+":9200", r))
 }
 
 func (m *Node) exportResult(ims []IntermediateMetric, tree string, reqTimestamp, rcvTimestamp int64) {
